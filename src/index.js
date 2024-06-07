@@ -1,46 +1,58 @@
-/**
- * Welcome to Cloudflare Workers! This is your first worker.
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your worker in action
- * - Run `npm run deploy` to publish your worker
- *
- * Learn more at https://developers.cloudflare.com/workers/
- */
+import { AutoRouter, html } from 'itty-router';
 
-import handleProxy from './proxy';
-import handleRedirect from './redirect';
-import apiRouter from './router';
+const router = AutoRouter();
 
-// Export a default object containing event handlers
-export default {
-	// The fetch handler is invoked when this worker receives a HTTP(S) request
-	// and should return a Response (optionally wrapped in a Promise)
-	async fetch(request, env, ctx) {
-		// You'll find it helpful to parse the request.url string into a URL object. Learn more at https://developer.mozilla.org/en-US/docs/Web/API/URL
-		const url = new URL(request.url);
+function generateState() {
+	return `gateway-owned_${crypto.randomUUID()}`;
+}
 
-		// You can get pretty far with simple logic like if/switch-statements
-		switch (url.pathname) {
-			case '/redirect':
-				return handleRedirect.fetch(request, env, ctx);
+router.get('/oauth/wargaming/authorize',() => html(
+	`
+	<html>
+	<p>Select Account Region</p>
+	<a href="/auth/wargaming/redirect?region=com">North America</a>
+	<a href="/auth/wargaming/redirect?region=eu">Europe</a>
+	<a href="/auth/wargaming/redirect?region=asia">Asia/OCE</a>
+	</html>
+		`
+) )
 
-			case '/proxy':
-				return handleProxy.fetch(request, env, ctx);
-		}
+// Root route to initiate OAuth flow
+router.get('/auth/wargaming/redirect', async (req, env, ctx) => {
+	const state = req.query.state ? req.query.state : generateState();
+	const redirectUri = `http://${req.headers.get('host')}/auth/wargaming/callback?state=${state}`;
+	const clientId = env.WARGAMING_APPLICATION_ID; // Wargaming application ID
 
-		if (url.pathname.startsWith('/api/')) {
-			// You can also use more robust routing
-			return apiRouter.handle(request);
-		}
+	// Store the state in KV for later validation
+	await env.OAuthStateKeys.put(`oauth-state-${state}`, 'true', { expirationTtl: 600 }); // Expires in 10 minutes
 
-		return new Response(
-			`Try making requests to:
-      <ul>
-      <li><code><a href="/redirect?redirectUrl=https://example.com/">/redirect?redirectUrl=https://example.com/</a></code>,</li>
-      <li><code><a href="/proxy?modify&proxyUrl=https://example.com/">/proxy?modify&proxyUrl=https://example.com/</a></code>, or</li>
-      <li><code><a href="/api/todos">/api/todos</a></code></li>`,
-			{ headers: { 'Content-Type': 'text/html' } }
-		);
-	},
-};
+	// Redirect user to Wargaming's authorization endpoint
+	const authUrl = `https://api.worldoftanks.${req.query.region}/wot/auth/login/?application_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&nofollow=0`;
+	return Response.redirect(authUrl);
+});
+
+// Callback route to handle the redirect from Wargaming
+router.get('/auth/wargaming/callback', async (req, env, ctx) => {
+	const url = new URL(req.url);
+	const access_token = url.searchParams.get('access_token');
+	const state = url.searchParams.get('state');
+
+	// Validate the state parameter
+	const validState = await env.OAuthStateKeys.get(`oauth-state-${state}`);
+	if (!validState) {
+		return new Response('Invalid state parameter', { status: 403 });
+	}
+
+	// Cleanup state from KV
+	//await env.OAuthStateKeys.delete(`oauth-state-${state}`);
+
+	const r = await fetch(`https://api.worldoftanks.asia/wgn/account/info/?application_id=${env.WARGAMING_APPLICATION_ID}&account_id=${url.searchParams.get('account_id')}&access_token=${access_token}`);
+	const userData = await r.json();
+	console.log(userData)
+	return new Response(`Authorization successful, code: ${access_token}. User Data: ${userData}`);
+});
+
+// Fallback
+router.all('*', () => new Response('Not Found.', { status: 404 }));
+
+export default { ...router }
